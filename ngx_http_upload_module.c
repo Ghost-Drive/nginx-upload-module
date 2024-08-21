@@ -165,6 +165,7 @@ typedef struct {
     ngx_http_upload_path_t        *store_path;
     ngx_uint_t                    store_access;
     size_t                        buffer_size;
+    ngx_http_complex_value_t      *store_filename;
     size_t                        merge_buffer_size;
     size_t                        range_header_buffer_size;
     size_t                        max_header_len;
@@ -358,6 +359,12 @@ static char *ngx_http_upload_merge_path_value(ngx_conf_t *cf, ngx_http_upload_pa
 static char *ngx_http_upload_cleanup(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static void ngx_upload_cleanup_handler(void *data);
+static char *ngx_http_upload_set_store_filename(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_upload_generate_filename(ngx_http_request_t *r,
+    ngx_http_upload_ctx_t *u, ngx_str_t *filename);
+static void ngx_http_upload_expand_variables(ngx_http_request_t *r,
+    ngx_str_t *dest, ngx_str_t *src);
 
 #if defined nginx_version && nginx_version >= 7052
 static ngx_path_init_t        ngx_http_upload_temp_path = {
@@ -501,6 +508,13 @@ static ngx_command_t  ngx_http_upload_commands[] = { /* {{{ */
       ngx_conf_set_size_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_upload_loc_conf_t, buffer_size),
+      NULL },
+
+    { ngx_string("upload_store_filename"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_upload_set_store_filename,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_upload_loc_conf_t, store_filename),
       NULL },
 
     /*
@@ -1396,9 +1410,22 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
         if(u->cln == NULL)
             return NGX_UPLOAD_NOMEM;
 
-        file->name.len = path->name.len + 1 + path->len + (u->session_id.len != 0 ? u->session_id.len : 10);
+        ngx_str_t custom_filename;
+        ngx_int_t rc = ngx_http_upload_generate_filename(u->request, u, &custom_filename);
+        
+        if (rc == NGX_OK) {
+            u->output_file.name.data = custom_filename.data;
+            u->output_file.name.len = custom_filename.len;
+        } else if (rc == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, u->request->connection->log, 0,
+                      "failed to use custom filename for upload");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
 
-        file->name.data = ngx_palloc(u->request->pool, file->name.len + 1);
+        if (rc != NGX_OK) {
+            file->name.len = path->name.len + 1 + path->len + (u->session_id.len != 0 ? u->session_id.len : 10);
+            file->name.data = ngx_palloc(u->request->pool, file->name.len + 1);
+        }
 
         if(file->name.data == NULL)
             return NGX_UPLOAD_NOMEM;
@@ -2226,6 +2253,7 @@ ngx_http_upload_create_loc_conf(ngx_conf_t *cf)
     conf->max_output_body_len = NGX_CONF_UNSET_SIZE;
     conf->max_file_size = NGX_CONF_UNSET;
     conf->limit_rate = NGX_CONF_UNSET_SIZE;
+    conf->store_filename = NULL;
 
     /*
      * conf->header_templates,
@@ -2248,6 +2276,8 @@ ngx_http_upload_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->url = prev->url;
         conf->url_cv = prev->url_cv;
     }
+
+    ngx_conf_merge_ptr_value(conf->store_filename, prev->store_filename, NULL);
 
     if(conf->url.len != 0) {
         ngx_http_upload_merge_path_value(cf,
@@ -2352,6 +2382,114 @@ ngx_http_upload_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     return NGX_CONF_OK;
 } /* }}} */
+
+static char *
+ngx_http_upload_set_store_filename(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_upload_loc_conf_t *ulcf = conf;
+    ngx_str_t                  *value;
+    ngx_http_complex_value_t   *cv;
+
+    if (ulcf->store_filename != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    cv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+    if (cv == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_http_compile_complex_value(cf, cv, &value[1]) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    ulcf->store_filename = cv;
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t
+ngx_http_upload_generate_filename(ngx_http_request_t *r, ngx_http_upload_ctx_t *u, ngx_str_t *filename)
+{
+    ngx_http_upload_loc_conf_t *ulcf;
+    ngx_str_t                   value;
+    u_char                     *p;
+
+    ulcf = ngx_http_get_module_loc_conf(r, ngx_http_upload_module);
+
+    if (ulcf->store_filename == NULL) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_http_complex_value(r, ulcf->store_filename, &value) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    filename->len = value.len;
+    filename->data = ngx_pnalloc(r->pool, value.len);
+    if (filename->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_http_upload_expand_variables(r, filename, &value);
+
+    p = ngx_strchr(filename->data, '/');
+    if (p) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "filename contains '/' character: \"%V\"", filename);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_upload_expand_variables(ngx_http_request_t *r, ngx_str_t *dest, ngx_str_t *src)
+{
+    u_char *d, *s, *e, ch;
+    ngx_uint_t i;
+    ngx_str_t var;
+    ngx_variable_value_t *vv;
+
+    d = dest->data;
+    s = src->data;
+    e = s + src->len;
+
+    while (s < e) {
+        ch = *s++;
+
+        if (ch != '$') {
+            *d++ = ch;
+            continue;
+        }
+
+        if (s == e) {
+            *d++ = ch;
+            break;
+        }
+
+        var.data = s;
+
+        for (i = 0; s < e; i++) {
+            ch = *s++;
+            if (ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                continue;
+            }
+            break;
+        }
+
+        var.len = s - var.data - 1;
+        vv = ngx_http_get_variable(r, &var, ngx_hash_key(var.data, var.len));
+
+        if (vv && !vv->not_found) {
+            d = ngx_copy(d, vv->data, vv->len);
+        }
+    }
+
+    dest->len = d - dest->data;
+}
+
 
 static ngx_int_t /* {{{ ngx_http_upload_add_variables */
 ngx_http_upload_add_variables(ngx_conf_t *cf)
@@ -4219,13 +4357,15 @@ upload_process_raw_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char 
 
 } /* }}} */
 
-static void /* {{{ ngx_upload_cleanup_handler */
+static void
 ngx_upload_cleanup_handler(void *data)
 {
     ngx_upload_cleanup_t        *cln = data;
     ngx_uint_t                  i;
     uint16_t                    *s;
     u_char                      do_cleanup = 0;
+    ngx_str_t                   custom_filename;
+    ngx_int_t                   rc;
 
     if(!cln->aborted) {
         if(cln->fd >= 0) {
@@ -4246,18 +4386,36 @@ ngx_upload_cleanup_handler(void *data)
         }
 
         if(do_cleanup) {
+            rc = ngx_http_upload_generate_filename(cln->request, NULL, &custom_filename);
+            if (rc == NGX_OK) {
+                if(ngx_delete_file(custom_filename.data) == NGX_FILE_ERROR) { 
+                    ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno
+                        , "failed to remove destination file \"%V\" after http status %ui"
+                        , &custom_filename
+                        , cln->headers_out->status
+                        );
+                } else {
+                    ngx_log_error(NGX_LOG_INFO, cln->log, 0
+                        , "finished cleanup of file \"%V\" after http status %ui"
+                        , &custom_filename
+                        , cln->headers_out->status
+                        );
+                }
+            } else {
                 if(ngx_delete_file(cln->filename) == NGX_FILE_ERROR) { 
                     ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno
-                        , "failed to remove destination file \"%s\" after http status %l"
+                        , "failed to remove destination file \"%s\" after http status %ui"
                         , cln->filename
                         , cln->headers_out->status
                         );
-                }else
+                } else {
                     ngx_log_error(NGX_LOG_INFO, cln->log, 0
-                        , "finished cleanup of file \"%s\" after http status %l"
+                        , "finished cleanup of file \"%s\" after http status %ui"
                         , cln->filename
                         , cln->headers_out->status
                         );
+                }
+            }
         }
     }
 } /* }}} */
